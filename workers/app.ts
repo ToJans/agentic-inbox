@@ -49,6 +49,12 @@ app.use("*", async (c, next) => {
 		return next();
 	}
 
+	// Inbound mail webhooks are machine-to-machine (no human, no CF Access JWT). They authenticate via
+	// their own provider signature (e.g. Mailgun HMAC in receiveMailgunInbound), so exempt them here.
+	if (c.req.path.startsWith("/api/inbound/")) {
+		return next();
+	}
+
 	const { POLICY_AUD, TEAM_DOMAIN } = c.env;
 
 	// Fail closed in production if Access is not configured.

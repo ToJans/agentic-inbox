@@ -202,7 +202,7 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 	}, attachmentData);
 
 	c.executionCtx.waitUntil(
-		sendEmail(c.env.EMAIL, {
+		sendEmail(c.env, {
 			to, cc, bcc, from, subject, html, text,
 			attachments: attachments?.map((att) => ({ content: att.content, filename: att.filename, type: att.type, disposition: att.disposition || "attachment", contentId: att.contentId })),
 			...(in_reply_to ? { headers: buildThreadingHeaders(in_reply_to, references || []) } : {}),
@@ -408,5 +408,107 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
 	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
 }
+
+// -- Mailgun inbound webhook ----------------------------------------
+// CPQ3D routes inbound via Mailgun (ai.cpq3d.com is a Mailgun domain; Cloudflare Email Routing isn't usable
+// here — subdomain zones are plan-gated and cpq3d.com's apex MX is Mailgun's). A Mailgun Route POSTs parsed
+// mail here; we verify Mailgun's signature (this path is exempt from the CF Access gate in app.ts, so the
+// signature IS the auth) and store it into the mailbox exactly like the Cloudflare receiveEmail() path.
+
+function ctEqualHex(a: string, b: string): boolean {
+	if (a.length !== b.length) return false;
+	let diff = 0;
+	for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+	return diff === 0;
+}
+
+async function verifyMailgunSignature(signingKey: string, timestamp: string, token: string, signature: string): Promise<boolean> {
+	if (!signingKey || !timestamp || !token || !signature) return false;
+	// Replay guard: Mailgun timestamps are unix seconds; reject anything older than 15 min.
+	if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 900) return false;
+	const enc = new TextEncoder();
+	const key = await crypto.subtle.importKey("raw", enc.encode(signingKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+	const mac = await crypto.subtle.sign("HMAC", key, enc.encode(timestamp + token));
+	const hex = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, "0")).join("");
+	return ctEqualHex(hex, signature);
+}
+
+const addressOf = (s: string): string => {
+	const m = s.match(/<([^>]+)>/);
+	return (m ? m[1] : s).trim().toLowerCase();
+};
+
+async function receiveMailgunInbound(c: Context<{ Bindings: Env }>): Promise<Response> {
+	const env = c.env;
+	const ctx = c.executionCtx as ExecutionContext;
+	const form = await c.req.formData();
+	const g = (k: string) => (form.get(k) as string) || "";
+
+	// 1. Auth = Mailgun signature (this route is exempt from CF Access).
+	if (!(await verifyMailgunSignature(env.MAILGUN_SIGNING_KEY, g("timestamp"), g("token"), g("signature")))) {
+		return c.text("invalid signature", 403);
+	}
+
+	// 2. Resolve the destination mailbox from the matched recipient.
+	const allowed = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
+	const recipient = g("recipient").toLowerCase();
+	const mailboxId = allowed.length > 0 ? (allowed.includes(recipient) ? recipient : undefined) : recipient;
+	if (!mailboxId) { console.log("Mailgun inbound: recipient not in EMAIL_ADDRESSES, ignoring."); return c.text("ignored", 200); }
+	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Mailgun inbound: mailbox ${mailboxId} does not exist, ignoring.`); return c.text("ignored", 200); }
+
+	const messageId = crypto.randomUUID();
+	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
+
+	// 3. Store attachments (Mailgun sends them as files attachment-1..N).
+	const attachmentData: StoredAttachment[] = [];
+	const attCount = parseInt(g("attachment-count") || "0", 10) || 0;
+	for (let i = 1; i <= attCount; i++) {
+		const f = form.get(`attachment-${i}`);
+		if (f instanceof File) {
+			const bytes = new Uint8Array(await f.arrayBuffer());
+			const attId = crypto.randomUUID();
+			const filename = (f.name || "untitled").replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_");
+			await env.BUCKET.put(`attachments/${messageId}/${attId}/${filename}`, bytes);
+			attachmentData.push({ id: attId, email_id: messageId, filename, mimetype: f.type || "application/octet-stream", size: bytes.byteLength, content_id: null, disposition: "attachment" });
+		}
+	}
+
+	// 4. Threading, from Mailgun's message-headers (JSON [[name,value],…]).
+	let headers: [string, string][] = [];
+	try { headers = JSON.parse(g("message-headers") || "[]"); } catch { /* ignore */ }
+	const hdr = (name: string) => headers.find(([n]) => n.toLowerCase() === name.toLowerCase())?.[1] || "";
+	const extractMsgId = (s: string) => { const m = s.match(/<([^>]+)>/); return m ? m[1] : s.trim().split(/\s+/)[0]; };
+	const inReplyTo = hdr("In-Reply-To") ? extractMsgId(hdr("In-Reply-To")) : null;
+	const emailReferences = hdr("References") ? hdr("References").split(/\s+/).filter(Boolean).map(extractMsgId) : [];
+	const senderAddr = addressOf(g("from") || g("sender"));
+	let threadId = emailReferences[0] || inReplyTo || messageId;
+	if (!inReplyTo && emailReferences.length === 0) {
+		const subjectThread = await (stub as any).findThreadBySubject(g("subject") || "", senderAddr || undefined);
+		if (subjectThread) threadId = subjectThread;
+	}
+	const originalMessageId = hdr("Message-Id") ? extractMsgId(hdr("Message-Id")) : null;
+
+	// 5. Persist into the mailbox INBOX — same shape as receiveEmail().
+	await stub.createEmail(Folders.INBOX, {
+		id: messageId, subject: g("subject") || "",
+		sender: senderAddr, recipient,
+		cc: g("Cc") || null, bcc: null,
+		date: new Date().toISOString(),
+		body: g("body-html") || g("body-plain") || g("stripped-text") || "",
+		in_reply_to: inReplyTo, email_references: emailReferences.length > 0 ? JSON.stringify(emailReferences) : null,
+		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(headers),
+	}, attachmentData);
+
+	// 6. Trigger the mailbox's auto-draft agent (same as the CF path).
+	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
+	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
+		method: "POST", headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ mailboxId, emailId: messageId, sender: senderAddr, subject: g("subject") || "", threadId }),
+	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
+
+	return c.json({ ok: true, mailbox: mailboxId, id: messageId });
+}
+
+app.post("/api/inbound/mailgun", receiveMailgunInbound);
 
 export { app, receiveEmail };

@@ -13,15 +13,25 @@
 		// Production deploys must also define POLICY_AUD and TEAM_DOMAIN.
 		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
 		// The worker now fails closed outside local development if Access is not configured.
-		"DOMAINS": "example.com",
-		"EMAIL_ADDRESSES": []
+		"DOMAINS": "ai.cpq3d.com",
+		"EMAIL_ADDRESSES": [
+			"cro@ai.cpq3d.com",
+			"cfo@ai.cpq3d.com",
+			"cmo@ai.cpq3d.com",
+			"cto@ai.cpq3d.com",
+			"cino@ai.cpq3d.com",
+			"coo@ai.cpq3d.com",
+			"ops@ai.cpq3d.com"
+		],
+		// Outbound goes through Mailgun (see workers/email-sender.ts), not the
+		// Cloudflare send_email binding (which only delivers to verified addresses).
+		// MAILGUN_DOMAIN is the sending subdomain; set MAILGUN_API_KEY as a secret:
+		//   wrangler secret put MAILGUN_API_KEY
+		"MAILGUN_DOMAIN": "ai.cpq3d.com",
+		// CPQ3D's Mailgun domain ai.cpq3d.com is in the EU region (DKIM/SPF point at eu.mailgun.org).
+		"MAILGUN_API_BASE": "https://api.eu.mailgun.net"
+		// "ARTICLE_URL": "https://cpq3d.com/..."  // set once the public article is live
 	},
-	"send_email": [
-		{
-			"name": "EMAIL",
-			"remote": true
-		}
-	],
 	"r2_buckets": [
 		{
 			"binding": "BUCKET",
