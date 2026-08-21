@@ -136,7 +136,8 @@ export async function verifyDraft(ai: Ai, body: string): Promise<string> {
 
 	try {
 		const response = (await ai.run(
-			"@cf/meta/llama-4-scout-17b-16e-instruct",
+			// Cast needed: Gemma 4 is not yet in @cloudflare/workers-types AiModels.
+			"@cf/google/gemma-4-26b-a4b-it" as unknown as Parameters<Ai["run"]>[0],
 			{
 				messages: [
 					{ role: "system", content: VERIFIER_PROMPT },
